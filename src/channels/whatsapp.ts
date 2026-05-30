@@ -324,7 +324,16 @@ registerChannelAdapter('whatsapp', {
         log.info('WA disconnected, message queued', { jid, queueSize: outgoingQueue.length });
         return;
       }
-      try {
+      // Legacy "pn-pn" group JIDs (e.g. 33627636796-1469435864@g.us) intermittently
+      // come back from sock.sendMessage with no key.id — the message is never relayed
+      // and platformMsgId ends up undefined. Community-style groups (12036...@g.us)
+      // and DMs are unaffected. The trigger is stale group metadata handed to Baileys
+      // via the cachedGroupMetadata callback (wrong participant addressing for the
+      // group's mode). On an empty result for a group, force a metadata refresh and
+      // retry once before queuing. First-try successes and DMs are unchanged.
+      // See diag 2026-05-30.
+      const isGroup = jid.endsWith('@g.us');
+      const trySend = async (): Promise<string | undefined> => {
         const sent = await sock.sendMessage(jid, { text });
         if (sent?.key?.id && sent.message) {
           sentMessageCache.set(sent.key.id, sent.message);
@@ -334,6 +343,24 @@ registerChannelAdapter('whatsapp', {
           }
         }
         return sent?.key?.id ?? undefined;
+      };
+      try {
+        let msgId = await trySend();
+        if (!msgId && isGroup) {
+          log.warn('Group send returned no message id; refreshing metadata and retrying once', { jid });
+          groupMetadataCache.delete(jid);
+          try {
+            await getNormalizedGroupMetadata(jid);
+          } catch (err) {
+            log.warn('Group metadata refresh before retry failed', { jid, err });
+          }
+          msgId = await trySend();
+          if (!msgId) {
+            log.error('Group send still returned no message id after retry; queuing for next flush', { jid });
+            outgoingQueue.push({ jid, text });
+          }
+        }
+        return msgId;
       } catch (err) {
         outgoingQueue.push({ jid, text });
         log.warn('Failed to send, message queued', { jid, err, queueSize: outgoingQueue.length });
