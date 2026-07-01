@@ -27,7 +27,13 @@ import {
   type ProviderContainerContribution,
   type VolumeMount,
 } from './providers/provider-container-registry.js';
-import { markContainerRunning, markContainerStopped, sessionDir, writeSessionRouting } from './session-manager.js';
+import {
+  heartbeatPath,
+  markContainerRunning,
+  markContainerStopped,
+  sessionDir,
+  writeSessionRouting,
+} from './session-manager.js';
 import type { AgentGroup, Session } from './types.js';
 
 const onecli = new OneCLI({ url: ONECLI_URL, apiKey: ONECLI_API_KEY });
@@ -91,6 +97,14 @@ async function spawnContainer(session: Session): Promise<void> {
     writeDestinations(agentGroup.id, session.id);
   }
   writeSessionRouting(agentGroup.id, session.id);
+  // Reset liveness avant spawn : une session reutilisee traine un .heartbeat
+  // perime du conteneur precedent, que le sweep lit comme un conteneur bloque
+  // => SIGKILL avant qu OpenCode demarre (~10s). Le supprimer.
+  try {
+    fs.rmSync(heartbeatPath(agentGroup.id, session.id), { force: true });
+  } catch {
+    /* ignore */
+  }
 
   // Read container config once — threaded through provider resolution,
   // buildMounts, and buildContainerArgs so we don't re-read the file.
