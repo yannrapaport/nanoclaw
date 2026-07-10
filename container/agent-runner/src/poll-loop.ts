@@ -81,6 +81,13 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
 
     const ids = messages.map((m) => m.id);
     markProcessing(ids);
+    // Write a heartbeat immediately after claiming so the host sweep sees
+    // the claim backed by a live heartbeat. Otherwise a slow cold start
+    // (opencode server spawn + session resume) leaves no heartbeat within
+    // CLAIM_STUCK_MS (60s), and the host kills the container as "claim-stuck"
+    // before it can deliver — this dropped the morning briefing. The
+    // absolute-ceiling (30min) still catches a genuinely hung container.
+    touchHeartbeat();
 
     const routing = extractRouting(messages);
 
