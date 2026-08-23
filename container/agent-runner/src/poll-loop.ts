@@ -9,6 +9,38 @@ import type { AgentProvider, AgentQuery, ProviderEvent } from './providers/types
 const POLL_INTERVAL_MS = 1000;
 const ACTIVE_POLL_INTERVAL_MS = 500;
 
+/**
+ * Don't repeat the same failure into the chat more than once per window.
+ * A provider that is down fails on every message, and a busy group turns
+ * that into a wall of identical stack traces.
+ */
+const ERROR_REPEAT_WINDOW_MS = 10 * 60_000;
+const ERROR_MAX_CHARS = 400;
+
+// eslint-disable-next-line no-control-regex
+const ANSI_RE = /\u001b\[[0-9;]*[A-Za-z]/g;
+
+/** Make a provider error fit for a chat message: no ANSI, no wall of text. */
+export function formatErrorForChat(message: string): string {
+  const cleaned = message
+    .replace(ANSI_RE, '')
+    .split('\n')
+    .map((line) => line.trimEnd())
+    .filter((line, i, all) => line.trim() !== '' || (i > 0 && all[i - 1].trim() !== ''))
+    .join('\n')
+    .trim();
+  if (cleaned.length <= ERROR_MAX_CHARS) return cleaned;
+  return `${cleaned.slice(0, ERROR_MAX_CHARS).trimEnd()}…`;
+}
+
+/**
+ * Collapse the volatile parts of an error (ports, timestamps, log paths,
+ * session ids) so the same underlying failure dedupes across attempts.
+ */
+export function errorDedupeKey(message: string): string {
+  return formatErrorForChat(message).replace(/\d+/g, '#');
+}
+
 function log(msg: string): void {
   console.error(`[poll-loop] ${msg}`);
 }
@@ -23,6 +55,12 @@ export interface PollLoopConfig {
   systemContext?: {
     instructions?: string;
   };
+  /**
+   * Optional stop signal. In the container the loop runs until the process
+   * dies; tests use this to shut a loop down instead of leaving it running
+   * and racing the next test for messages.
+   */
+  signal?: AbortSignal;
 }
 
 /**
@@ -51,7 +89,10 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
   clearStaleProcessingAcks();
 
   let pollCount = 0;
-  while (true) {
+  let lastPostedErrorKey: string | null = null;
+  let lastPostedErrorAt = 0;
+  let suppressedErrors = 0;
+  while (!config.signal?.aborted) {
     // Skip system messages — they're responses for MCP tools (e.g., ask_user_question)
     const messages = getPendingMessages().filter((m) => m.kind !== 'system');
     pollCount++;
@@ -163,6 +204,9 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
       systemContext: config.systemContext,
     });
 
+    const onAbort = (): void => query.abort();
+    config.signal?.addEventListener('abort', onAbort, { once: true });
+
     // Process the query while concurrently polling for new messages
     const skippedSet = new Set(skipped);
     const processingIds = ids.filter((id) => !commandIds.includes(id) && !skippedSet.has(id));
@@ -185,15 +229,34 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
         clearStoredSessionId();
       }
 
-      // Write error response so the user knows something went wrong
-      writeMessageOut({
-        id: generateId(),
-        kind: 'chat',
-        platform_id: routing.platformId,
-        channel_type: routing.channelType,
-        thread_id: routing.threadId,
-        content: JSON.stringify({ text: `Error: ${errMsg}` }),
-      });
+      // Tell the user something went wrong — but only once per distinct
+      // failure per window. Repeating an identical provider error for every
+      // inbound message turns a broken provider into chat spam.
+      const key = errorDedupeKey(errMsg);
+      const now = Date.now();
+      const isRepeat = key === lastPostedErrorKey;
+      if (isRepeat && now - lastPostedErrorAt < ERROR_REPEAT_WINDOW_MS) {
+        suppressedErrors++;
+        log(`Suppressing repeat error (${suppressedErrors} identical since last report)`);
+      } else {
+        const suffix =
+          isRepeat && suppressedErrors > 0
+            ? `\n(and ${suppressedErrors} more like it since the last report)`
+            : '';
+        writeMessageOut({
+          id: generateId(),
+          kind: 'chat',
+          platform_id: routing.platformId,
+          channel_type: routing.channelType,
+          thread_id: routing.threadId,
+          content: JSON.stringify({ text: `Error: ${formatErrorForChat(errMsg)}${suffix}` }),
+        });
+        lastPostedErrorKey = key;
+        lastPostedErrorAt = now;
+        suppressedErrors = 0;
+      }
+    } finally {
+      config.signal?.removeEventListener('abort', onAbort);
     }
 
     // Ensure completed even if processQuery ended without a result event

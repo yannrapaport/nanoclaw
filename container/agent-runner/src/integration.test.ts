@@ -4,7 +4,27 @@ import { initTestSessionDb, closeSessionDb, getInboundDb, getOutboundDb } from '
 import { getUndeliveredMessages } from './db/messages-out.js';
 import { getPendingMessages } from './db/messages-in.js';
 import { MockProvider } from './providers/mock.js';
+import type { AgentProvider, AgentQuery, ProviderEvent } from './providers/types.js';
 import { runPollLoop } from './poll-loop.js';
+
+/** Provider that fails every turn the same way — a down OpenCode server. */
+class FailingProvider implements AgentProvider {
+  readonly supportsNativeSlashCommands = false;
+  constructor(private readonly message: string) {}
+  isSessionInvalid(): boolean {
+    return false;
+  }
+  query(): AgentQuery {
+    const message = this.message;
+    const events: AsyncIterable<ProviderEvent> = {
+      // eslint-disable-next-line require-yield
+      async *[Symbol.asyncIterator]() {
+        throw new Error(message);
+      },
+    };
+    return { push: () => {}, end: () => {}, events, abort: () => {} };
+  }
+}
 
 beforeEach(() => {
   initTestSessionDb();
@@ -74,6 +94,37 @@ describe('poll loop integration', () => {
     await loopPromise.catch(() => {});
   });
 
+  it('reports a repeated provider failure once, not on every message', async () => {
+    insertMessage('m1', { sender: 'Alice', text: 'Hello' }, { platformId: 'chan-1', channelType: 'discord' });
+
+    const provider = new FailingProvider(
+      'OpenCode server exited with code 1\nServer output: \u001b[91mFailed to start server on port 4096\u001b[0m',
+    );
+    const controller = new AbortController();
+    const loopPromise = runPollLoopWithTimeout(provider, controller.signal, 8000);
+
+    await waitFor(() => getUndeliveredMessages().length > 0, 3000);
+
+    const first = getUndeliveredMessages();
+    expect(first).toHaveLength(1);
+    const text = JSON.parse(first[0].content).text;
+    expect(text).toContain('Failed to start server on port 4096');
+    expect(text).not.toContain('\u001b');
+
+    // More traffic arrives while the provider is still broken.
+    insertMessage('m2', { sender: 'Bob', text: 'Still there?' }, { platformId: 'chan-1', channelType: 'discord' });
+    await waitFor(() => getPendingMessages().length === 0, 3000);
+    insertMessage('m3', { sender: 'Carol', text: 'Hello?' }, { platformId: 'chan-1', channelType: 'discord' });
+    await waitFor(() => getPendingMessages().length === 0, 3000);
+
+    controller.abort();
+
+    // Same failure — reported once, not once per message.
+    expect(getUndeliveredMessages()).toHaveLength(1);
+
+    await loopPromise.catch(() => {});
+  });
+
   it('should process messages arriving after loop starts', async () => {
     const provider = new MockProvider({}, () => '<message to="discord-test">Processed</message>');
     const controller = new AbortController();
@@ -94,11 +145,12 @@ describe('poll loop integration', () => {
 });
 
 // Helper: run poll loop until aborted or timeout
-async function runPollLoopWithTimeout(provider: MockProvider, signal: AbortSignal, timeoutMs: number): Promise<void> {
+async function runPollLoopWithTimeout(provider: AgentProvider, signal: AbortSignal, timeoutMs: number): Promise<void> {
   return Promise.race([
     runPollLoop({
       provider,
       cwd: '/tmp',
+      signal,
     }),
     new Promise<void>((_, reject) => {
       signal.addEventListener('abort', () => reject(new Error('aborted')));

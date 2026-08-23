@@ -5,6 +5,7 @@ import { getPendingMessages, markCompleted } from './db/messages-in.js';
 import { getUndeliveredMessages } from './db/messages-out.js';
 import { formatMessages, extractRouting } from './formatter.js';
 import { MockProvider } from './providers/mock.js';
+import { formatErrorForChat, errorDedupeKey } from './poll-loop.js';
 
 beforeEach(() => {
   initTestSessionDb();
@@ -244,5 +245,34 @@ describe('end-to-end with mock provider', () => {
     expect(outMessages).toHaveLength(1);
     expect(JSON.parse(outMessages[0].content).text).toBe('The answer is 4');
     expect(outMessages[0].in_reply_to).toBe('m1');
+  });
+});
+
+describe('error formatting for chat', () => {
+  it('strips ANSI escapes from provider output', () => {
+    const raw = 'OpenCode server exited with code 1\n\u001b[91m\u001b[1mError: \u001b[0mUnexpected error';
+    const out = formatErrorForChat(raw);
+    expect(out).not.toContain('\u001b');
+    expect(out).toContain('Unexpected error');
+  });
+
+  it('collapses blank runs and truncates long dumps', () => {
+    const raw = `head\n\n\n\ntail ${'x'.repeat(600)}`;
+    const out = formatErrorForChat(raw);
+    expect(out).toContain('head\n\ntail');
+    expect(out.length).toBeLessThanOrEqual(401);
+    expect(out.endsWith('…')).toBe(true);
+  });
+
+  it('dedupes the same failure across attempts with different ports and log names', () => {
+    const a = 'Failed to start server on port 4096, log /opencode-xdg/log/2026-08-23T093221.log';
+    const b = 'Failed to start server on port 4097, log /opencode-xdg/log/2026-08-23T093544.log';
+    expect(errorDedupeKey(a)).toBe(errorDedupeKey(b));
+  });
+
+  it('keeps distinct failures distinct', () => {
+    expect(errorDedupeKey('OpenCode event timeout (90000ms)')).not.toBe(
+      errorDedupeKey('OpenCode server exited with code 1'),
+    );
   });
 });

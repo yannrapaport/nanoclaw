@@ -17,20 +17,68 @@ const SESSION_STATUS_RETRY_ERROR_AFTER = 3;
 const STALE_SESSION_RE =
   /no conversation found|ENOENT.*\.jsonl|session.*not found|NotFoundError|connection reset|ECONNRESET|404|event timeout/i;
 
-function spawnOpencodeServer(config: Record<string, unknown>, timeoutMs = 45_000): Promise<{ url: string; proc: ChildProcess }> {
+/** Base port for `opencode serve`; consecutive ports are tried if it is taken. */
+const SERVER_PORT_BASE = 4096;
+const SERVER_PORT_ATTEMPTS = 5;
+const SERVER_SPAWN_TIMEOUT_MS = 45_000;
+
+/**
+ * Kill the server's whole process group.
+ *
+ * `opencode` is a JS wrapper that execs the platform binary as a child, so
+ * SIGKILL on the process we spawned leaves the real server alive — still
+ * holding its port. Every later spawn then died with "Failed to start server
+ * on port 4096" and the agent answered every message with that error. We
+ * spawn detached (own process group) so a negative-pid kill takes the wrapper
+ * and the server down together.
+ */
+export function killServerTree(proc: ChildProcess): void {
+  // Kill the group even when the process we spawned has already exited: the
+  // wrapper can be gone while the server it started is still listening.
+  if (typeof proc.pid === 'number') {
+    try {
+      process.kill(-proc.pid, 'SIGKILL');
+      return;
+    } catch {
+      /* whole group already gone, or not a group leader — fall through */
+    }
+  }
+  if (proc.exitCode !== null || proc.signalCode !== null) return;
+  try {
+    proc.kill('SIGKILL');
+  } catch {
+    /* ignore */
+  }
+}
+
+function spawnOpencodeServer(
+  config: Record<string, unknown>,
+  port: number,
+  timeoutMs = SERVER_SPAWN_TIMEOUT_MS,
+): Promise<{ url: string; proc: ChildProcess }> {
   return new Promise((resolve, reject) => {
     const hostname = '127.0.0.1';
-    const port = 4096;
     const proc = spawn('opencode', ['serve', `--hostname=${hostname}`, `--port=${port}`], {
+      detached: true,
       env: {
         ...process.env,
         OPENCODE_CONFIG_CONTENT: JSON.stringify(config),
       },
     });
 
+    let settled = false;
+    const finish = (fn: () => void): void => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(id);
+      fn();
+    };
+
     const id = setTimeout(() => {
-      proc.kill('SIGKILL');
-      reject(new Error(`Timeout waiting for OpenCode server to start after ${timeoutMs}ms`));
+      finish(() => {
+        killServerTree(proc);
+        reject(new Error(`Timeout waiting for OpenCode server to start after ${timeoutMs}ms`));
+      });
     }, timeoutMs);
 
     let output = '';
@@ -40,8 +88,7 @@ function spawnOpencodeServer(config: Record<string, unknown>, timeoutMs = 45_000
         if (line.startsWith('opencode server listening')) {
           const match = line.match(/on\s+(https?:\/\/[^\s]+)/);
           if (match) {
-            clearTimeout(id);
-            resolve({ url: match[1], proc });
+            finish(() => resolve({ url: match[1], proc }));
           }
         }
       }
@@ -50,16 +97,35 @@ function spawnOpencodeServer(config: Record<string, unknown>, timeoutMs = 45_000
       output += chunk.toString();
     });
     proc.on('exit', (code) => {
-      clearTimeout(id);
-      let msg = `OpenCode server exited with code ${code}`;
-      if (output.trim()) msg += `\nServer output: ${output}`;
-      reject(new Error(msg));
+      finish(() => {
+        let msg = `OpenCode server exited with code ${code}`;
+        if (output.trim()) msg += `\nServer output: ${output}`;
+        reject(new Error(msg));
+      });
     });
     proc.on('error', (err) => {
-      clearTimeout(id);
-      reject(err);
+      finish(() => reject(err));
     });
   });
+}
+
+/**
+ * Start the server, walking a few ports. A leftover server from a previous
+ * runtime (or anything else on the box) holding the base port is a transient
+ * condition, not a reason to fail every turn until the container restarts.
+ */
+export async function startOpencodeServer(config: Record<string, unknown>): Promise<{ url: string; proc: ChildProcess }> {
+  let lastErr: unknown;
+  for (let i = 0; i < SERVER_PORT_ATTEMPTS; i++) {
+    const port = SERVER_PORT_BASE + i;
+    try {
+      return await spawnOpencodeServer(config, port);
+    } catch (err) {
+      lastErr = err;
+      log(`OpenCode server failed to start on port ${port}: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+  throw lastErr instanceof Error ? lastErr : new Error(String(lastErr));
 }
 
 function readClaudeMdForPrompt(): string | undefined {
@@ -165,16 +231,17 @@ async function ensureSharedRuntime(options: ProviderOptions): Promise<SharedRunt
 
   if (sharedInit) return sharedInit;
 
-  sharedInit = (async () => {
+  const init = (async () => {
     if (sharedRuntime) {
       destroySharedRuntime();
     }
     const config = buildOpenCodeConfig(options);
-    const { url, proc } = await spawnOpencodeServer(config);
+    installExitHooks();
+    const { url, proc } = await startOpencodeServer(config);
     const client = createOpencodeClient({ baseUrl: url });
     const sub = await client.event.subscribe();
     const stream = sub.stream as AsyncGenerator<{ type: string; properties: Record<string, unknown> }, void, void>;
-    sharedRuntime = {
+    const runtime: SharedRuntime = {
       proc,
       client,
       stream,
@@ -182,12 +249,40 @@ async function ensureSharedRuntime(options: ProviderOptions): Promise<SharedRunt
         void stream.return?.(undefined);
       },
     };
+    sharedRuntime = runtime;
     sharedConfigKey = key;
-    sharedInit = null;
-    return sharedRuntime;
+    return runtime;
   })();
 
-  return sharedInit;
+  sharedInit = init;
+  try {
+    return await init;
+  } finally {
+    // Clear the in-flight marker whether the start succeeded or failed.
+    // Leaving a *rejected* promise here made one bad start permanent: every
+    // later turn awaited the same rejection, never retried the spawn, and
+    // replied to every message with the identical error text.
+    // Identity check: a concurrent destroy may already have swapped it.
+    if (sharedInit === init) sharedInit = null;
+  }
+}
+
+/**
+ * A detached server does not receive the runner's signals, so kill it
+ * explicitly on the way out — otherwise it survives the runner and keeps
+ * holding its port for whatever starts next.
+ */
+let exitHooksInstalled = false;
+function installExitHooks(): void {
+  if (exitHooksInstalled) return;
+  exitHooksInstalled = true;
+  process.on('exit', () => destroySharedRuntime());
+  for (const signal of ['SIGTERM', 'SIGINT'] as const) {
+    process.once(signal, () => {
+      destroySharedRuntime();
+      process.exit(signal === 'SIGINT' ? 130 : 143);
+    });
+  }
 }
 
 export function destroySharedRuntime(): void {
@@ -197,11 +292,7 @@ export function destroySharedRuntime(): void {
     } catch {
       /* ignore */
     }
-    try {
-      sharedRuntime.proc.kill('SIGKILL');
-    } catch {
-      /* ignore */
-    }
+    killServerTree(sharedRuntime.proc);
     sharedRuntime = null;
     sharedConfigKey = null;
   }
@@ -317,8 +408,19 @@ export class OpenCodeProvider implements AgentProvider {
               throw new Error(`OpenCode event timeout (${IDLE_TIMEOUT_MS}ms)`);
             }
 
-            const { value: ev, done } = await stream.next();
+            let next: IteratorResult<{ type: string; properties: Record<string, unknown> }, void>;
+            try {
+              next = await stream.next();
+            } catch (err) {
+              // The idle timer kills the server, which makes the in-flight
+              // SSE read fail. Report the timeout — the real cause — rather
+              // than the socket error it produced.
+              if (eventTimedOut) throw new Error(`OpenCode event timeout (${IDLE_TIMEOUT_MS}ms)`);
+              throw err;
+            }
+            const { value: ev, done } = next;
             if (done) {
+              if (eventTimedOut) throw new Error(`OpenCode event timeout (${IDLE_TIMEOUT_MS}ms)`);
               throw new Error('OpenCode SSE stream ended unexpectedly');
             }
 
