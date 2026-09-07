@@ -45,6 +45,7 @@ registerProviderContainerConfig('opencode', (ctx) => {
     const value = ctx.hostEnv[key];
     if (value) env[key] = value;
   }
+  if (ctx.model) env.OPENCODE_MODEL = ctx.model;
 
   return {
     mounts: [{ hostPath: opencodeDir, containerPath: '/opencode-xdg', readonly: false }],

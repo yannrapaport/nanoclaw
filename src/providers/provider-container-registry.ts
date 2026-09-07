@@ -29,6 +29,8 @@ export interface ProviderContainerContext {
   agentGroupId: string;
   /** `process.env` at spawn time — pull passthrough values from here. */
   hostEnv: NodeJS.ProcessEnv;
+  /** Per-group model override from container.json (`model`), if any. */
+  model?: string;
 }
 
 export interface ProviderContainerContribution {

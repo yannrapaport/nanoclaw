@@ -47,6 +47,12 @@ export interface ContainerConfig {
   agentGroupId?: string;
   /** Max messages per prompt. Falls back to code default if unset. */
   maxMessagesPerPrompt?: number;
+  /**
+   * Per-group model override, in the provider's own id format
+   * (e.g. "anthropic/claude-sonnet-4-5-20250929" for opencode). Overrides the
+   * host-level OPENCODE_MODEL. Unset = host default.
+   */
+  model?: string;
 }
 
 function emptyConfig(): ContainerConfig {
@@ -87,6 +93,7 @@ export function readContainerConfig(folder: string): ContainerConfig {
       assistantName: raw.assistantName,
       agentGroupId: raw.agentGroupId,
       maxMessagesPerPrompt: raw.maxMessagesPerPrompt,
+      model: raw.model,
     };
   } catch (err) {
     console.error(`[container-config] failed to parse ${p}: ${String(err)}`);
