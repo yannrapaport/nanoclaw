@@ -4,6 +4,7 @@ import { initTestSessionDb, closeSessionDb, getInboundDb, getOutboundDb } from '
 import { getPendingMessages, markCompleted } from './db/messages-in.js';
 import { getUndeliveredMessages } from './db/messages-out.js';
 import { formatMessages, extractRouting } from './formatter.js';
+import { errorMessageForChat } from './poll-loop.js';
 import { MockProvider } from './providers/mock.js';
 
 beforeEach(() => {
@@ -244,5 +245,23 @@ describe('end-to-end with mock provider', () => {
     expect(outMessages).toHaveLength(1);
     expect(JSON.parse(outMessages[0].content).text).toBe('The answer is 4');
     expect(outMessages[0].in_reply_to).toBe('m1');
+  });
+});
+
+describe('errorMessageForChat', () => {
+  const err = 'Your credit balance is too low to access the Anthropic API.';
+
+  it('surfaces the error in a DM', () => {
+    expect(errorMessageForChat({ platformId: '33600000000@s.whatsapp.net', channelType: 'whatsapp' }, err)).toBe(
+      `Error: ${err}`,
+    );
+  });
+
+  it('stays silent in a WhatsApp group', () => {
+    expect(errorMessageForChat({ platformId: '120363000000000000@g.us', channelType: 'whatsapp' }, err)).toBeNull();
+  });
+
+  it('surfaces the error when routing is unknown', () => {
+    expect(errorMessageForChat({ platformId: null, channelType: null }, err)).toBe(`Error: ${err}`);
   });
 });

@@ -185,15 +185,19 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
         clearStoredSessionId();
       }
 
-      // Write error response so the user knows something went wrong
-      writeMessageOut({
-        id: generateId(),
-        kind: 'chat',
-        platform_id: routing.platformId,
-        channel_type: routing.channelType,
-        thread_id: routing.threadId,
-        content: JSON.stringify({ text: `Error: ${errMsg}` }),
-      });
+      // Write error response so the user knows something went wrong —
+      // but never in a group chat (see errorMessageForChat).
+      const errText = errorMessageForChat(routing, errMsg);
+      if (errText) {
+        writeMessageOut({
+          id: generateId(),
+          kind: 'chat',
+          platform_id: routing.platformId,
+          channel_type: routing.channelType,
+          thread_id: routing.threadId,
+          content: JSON.stringify({ text: errText }),
+        });
+      }
     }
 
     // Ensure completed even if processQuery ended without a result event
@@ -201,6 +205,23 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
     markCompleted(processingIds);
     log(`Completed ${ids.length} message(s)`);
   }
+}
+
+/**
+ * Text to post back when a query fails, or null to stay silent.
+ *
+ * A raw API error ("credit balance too low", rate limit, …) is useful in a
+ * DM with the owner, but in a group it leaks operational noise to people
+ * who can't act on it. The error is always logged; only the chat echo is
+ * suppressed. WhatsApp groups are identified by the `@g.us` suffix.
+ */
+export function errorMessageForChat(
+  routing: { platformId: string | null; channelType: string | null },
+  errMsg: string,
+): string | null {
+  const isWhatsAppGroup = routing.channelType === 'whatsapp' && !!routing.platformId?.endsWith('@g.us');
+  if (isWhatsAppGroup) return null;
+  return `Error: ${errMsg}`;
 }
 
 /**
