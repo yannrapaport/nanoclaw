@@ -3,6 +3,7 @@
  *
  * Usage:
  *   pnpm tsx scripts/send.ts <alias> <message...>
+ *   pnpm tsx scripts/send.ts --raw <alias> <message...>
  *   pnpm tsx scripts/send.ts --list
  *
  * Pipes the message into the daemon's `cli.sock` admin transport
@@ -10,6 +11,10 @@
  * resolved (channelType, platformId, threadId) — i.e. the wired agent
  * (Herbert, Coach Roger, …) sees it as a message in that group and
  * responds. NOT a raw delivery: the agent re-engages with its persona.
+ *
+ * `--raw` posts the text verbatim instead (src/channels/raw-deliver.ts): no
+ * agent wakes up, and the daemon answers with the platform message id. Use it
+ * when the caller already holds the final text (lp-inbox deliverables).
  *
  * Alias resolution (case-insensitive, in order):
  *   1. exact match on agent_groups.folder, with or without channel prefix
@@ -20,6 +25,7 @@
  * Exit codes:
  *   0 OK | 1 usage | 2 socket unreachable | 3 alias unresolved | 4 ambiguous
  *   5 message qui ne reveillerait pas l'agent (groupe mention-only) — cf. willEngage()
+ *   6 --raw : envoi non confirme par la plateforme (ou refuse par le daemon)
  */
 import net from 'net';
 import path from 'path';
@@ -170,6 +176,68 @@ function printList(groups: GroupRow[], aliases: Map<GroupRow, string>): void {
   }
 }
 
+/**
+ * --raw : un seul echange requete/reponse. Le daemon ecrit une ligne JSON
+ * `{ok, messageId}` ou `{ok:false, error}` ; on la lit avant de fermer.
+ */
+function deliverRaw(group: GroupRow, text: string): Promise<number> {
+  return new Promise((resolve) => {
+    const sock = socketPath();
+    const socket = net.connect(sock);
+    let buffer = '';
+    let settled = false;
+    const done = (code: number) => {
+      if (settled) return;
+      settled = true;
+      socket.destroy();
+      resolve(code);
+    };
+
+    socket.on('error', (err) => {
+      const e = err as NodeJS.ErrnoException;
+      if (e.code === 'ENOENT' || e.code === 'ECONNREFUSED') {
+        console.error(`NanoClaw daemon not reachable at ${sock}.`);
+      } else {
+        console.error('CLI socket error:', err.message);
+      }
+      done(2);
+    });
+
+    socket.on('connect', () => {
+      const payload = {
+        deliver: true,
+        text,
+        to: { channelType: group.channel_type, platformId: group.platform_id, threadId: null },
+      };
+      socket.write(JSON.stringify(payload) + '\n');
+    });
+
+    socket.on('data', (chunk) => {
+      buffer += chunk.toString('utf8');
+      const idx = buffer.indexOf('\n');
+      if (idx < 0) return;
+      const line = buffer.slice(0, idx);
+      // stdout = la reponse brute, pour un appelant qui veut le messageId.
+      console.log(line);
+      try {
+        done(JSON.parse(line).ok === true ? 0 : 6);
+      } catch {
+        done(6);
+      }
+    });
+
+    // Un daemon d'avant --raw ignore `deliver` et ROUTE le texte vers l'agent
+    // (le champ `to` suffit a l'admin transport) : l'agent repond, et rien ne
+    // revient sur ce socket. Redemarrer le daemon avant tout usage de --raw.
+    // Ce delai evite seulement d'attendre indefiniment.
+    socket.setTimeout(30_000, () => {
+      console.error('Pas de reponse du daemon (version sans --raw ?).');
+      done(6);
+    });
+    socket.on('close', () => done(6));
+  });
+}
+
 function pushToSocket(group: GroupRow, text: string): Promise<number> {
   return new Promise((resolve) => {
     const sock = socketPath();
@@ -227,7 +295,8 @@ async function main(): Promise<void> {
   }
 
   const force = args.includes('--force');
-  const positional = args.filter((a) => a !== '--force');
+  const raw = args.includes('--raw');
+  const positional = args.filter((a) => a !== '--force' && a !== '--raw');
   const alias = positional[0];
   const message = positional.slice(1).join(' ');
   if (!message) {
@@ -246,6 +315,11 @@ async function main(): Promise<void> {
       console.error(`  ${aliases.get(c) ?? '(?)'}  (${c.group_name}, ${c.agent_name})`);
     }
     process.exit(4);
+  }
+
+  if (raw) {
+    console.error(`→ raw on ${resolved.ok.channel_type}/${resolved.ok.group_name} (${resolved.ok.platform_id})`);
+    process.exit(await deliverRaw(resolved.ok, message));
   }
 
   const engage = willEngage(resolved.ok, message);

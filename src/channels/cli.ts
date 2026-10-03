@@ -15,8 +15,11 @@
  *                             "platformId": "discord:@me:149...",
  *                             "threadId": null} }         # route to a specific mg
  *     { "text": "...", "to": {...}, "reply_to": {...} }   # + redirect replies
+ *     { "deliver": true, "text": "...", "to": {...} }     # post verbatim, no agent
  *   Server → client:
  *     { "text": "agent reply" }
+ *     { "ok": true, "messageId": "..." }                  # answer to `deliver`
+ *     { "ok": false, "error": "..." }                     # (see raw-deliver.ts)
  *
  * The `to` and `reply_to` addressing is how admin transports (the bootstrap
  * script) inject messages targeting any wired channel. `reply_to` is a
@@ -38,9 +41,11 @@ import net from 'net';
 import path from 'path';
 
 import { DATA_DIR } from '../config.js';
+import { getMessagingGroupByPlatform } from '../db/messaging-groups.js';
 import { log } from '../log.js';
 import type { ChannelAdapter, ChannelSetup, DeliveryAddress, InboundEvent, OutboundMessage } from './adapter.js';
-import { registerChannelAdapter } from './channel-registry.js';
+import { getChannelAdapter, registerChannelAdapter } from './channel-registry.js';
+import { rawDeliver } from './raw-deliver.js';
 
 const PLATFORM_ID = 'local';
 
@@ -164,7 +169,7 @@ function createAdapter(): ChannelAdapter {
         const line = buffer.slice(0, idx).trim();
         buffer = buffer.slice(idx + 1);
         if (!line) continue;
-        void handleLine(line, config, claimChatSlot);
+        void handleLine(line, config, claimChatSlot, socket);
       }
     });
 
@@ -178,8 +183,14 @@ function createAdapter(): ChannelAdapter {
     });
   }
 
-  async function handleLine(line: string, config: ChannelSetup, claimChatSlot: () => void): Promise<void> {
+  async function handleLine(
+    line: string,
+    config: ChannelSetup,
+    claimChatSlot: () => void,
+    socket: net.Socket,
+  ): Promise<void> {
     let payload: {
+      deliver?: unknown;
       text?: unknown;
       to?: unknown;
       reply_to?: unknown;
@@ -196,6 +207,31 @@ function createAdapter(): ChannelAdapter {
 
     const to = parseAddress(payload.to);
     const replyTo = parseAddress(payload.reply_to);
+
+    if (payload.deliver === true) {
+      // Raw delivery — one-shot like the routed admin transport, never claims
+      // the chat slot. Without `to` there is nothing to deliver to.
+      const result = to
+        ? await rawDeliver(to, payload.text, { getMessagingGroupByPlatform, getChannelAdapter }).catch(
+            (err: unknown) => {
+              log.error('CLI: raw delivery threw', { err });
+              return { ok: false as const, error: 'deliver_threw' };
+            },
+          )
+        : { ok: false as const, error: 'missing_to' };
+      log.info('CLI raw delivery', {
+        channelType: to?.channelType,
+        platformId: to?.platformId,
+        chars: payload.text.length,
+        ...result,
+      });
+      try {
+        socket.write(JSON.stringify(result) + '\n');
+      } catch (err) {
+        log.warn('CLI: failed to answer raw delivery', { err });
+      }
+      return;
+    }
 
     if (to) {
       // Routed message — admin transport. Build a full InboundEvent targeting
