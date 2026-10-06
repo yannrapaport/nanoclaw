@@ -165,6 +165,7 @@ registerChannelAdapter('whatsapp', {
     // LID → phone JID mapping (WhatsApp's new ID system)
     const lidToPhoneMap: Record<string, string> = {};
     let botLidUser: string | undefined;
+    let botPhoneUser: string | undefined;
 
     // Outgoing queue for messages sent while disconnected
     const outgoingQueue: Array<{ jid: string; text: string }> = [];
@@ -204,6 +205,13 @@ registerChannelAdapter('whatsapp', {
       lidToPhoneMap[lidUser] = phoneJid;
       // Cached group metadata depends on participant IDs — invalidate
       groupMetadataCache.clear();
+    }
+
+    /** True when the JID (phone or LID form, with or without device suffix) is the bot itself. */
+    function isBotJid(jid: string | null | undefined): boolean {
+      if (!jid) return false;
+      const user = jid.split('@')[0].split(':')[0];
+      return user === botLidUser || user === botPhoneUser;
     }
 
     async function translateJid(jid: string): Promise<string> {
@@ -262,6 +270,9 @@ registerChannelAdapter('whatsapp', {
             count++;
           }
         }
+        setupConfig.onGroupsSynced?.(
+          Object.entries(groups).map(([jid, metadata]) => ({ platformId: jid, name: metadata.subject || undefined })),
+        );
         lastGroupSync = Date.now();
         log.info('Group metadata synced', { count });
       } catch (err) {
@@ -472,6 +483,7 @@ registerChannelAdapter('whatsapp', {
           if (sock.user) {
             const phoneUser = sock.user.id.split(':')[0];
             const lidUser = sock.user.lid?.split(':')[0];
+            botPhoneUser = phoneUser;
             if (lidUser && phoneUser) {
               setLidPhoneMapping(lidUser, `${phoneUser}@s.whatsapp.net`);
               botLidUser = lidUser;
@@ -508,6 +520,30 @@ registerChannelAdapter('whatsapp', {
       (sock.ev.on as any)('chats.phoneNumberShare', ({ lid, jid }: { lid?: string; jid?: string }) => {
         const lidUser = lid?.split('@')[0].split(':')[0];
         if (lidUser && jid) setLidPhoneMapping(lidUser, jid);
+      });
+
+      // The bot was added to a group. WhatsApp announces it either as a new
+      // group (groups.upsert) or as a participant change on a group it had
+      // left; the host dedups.
+      sock.ev.on('groups.upsert', (groups) => {
+        for (const metadata of groups) {
+          groupMetadataCache.delete(metadata.id);
+          setupConfig.onGroupJoined?.(metadata.id, metadata.subject || undefined);
+        }
+      });
+      sock.ev.on('group-participants.update', async ({ id, participants, action }) => {
+        if (action !== 'add') return;
+        // Baileys 6 hands plain JIDs, Baileys 7 hands participant objects.
+        const jids = (participants as unknown[]).map((p) => (typeof p === 'string' ? p : (p as { id?: string })?.id));
+        if (!jids.some((jid) => isBotJid(jid))) return;
+        groupMetadataCache.delete(id);
+        let subject: string | undefined;
+        try {
+          subject = (await getNormalizedGroupMetadata(id))?.subject || undefined;
+        } catch (err) {
+          log.debug('Could not read the subject of a joined group', { id, err });
+        }
+        setupConfig.onGroupJoined?.(id, subject);
       });
 
       // Inbound messages
@@ -548,6 +584,18 @@ registerChannelAdapter('whatsapp', {
             if (botLidUser && content.includes(`@${botLidUser}`)) {
               content = content.replace(`@${botLidUser}`, `@${ASSISTANT_NAME}`);
             }
+
+            // In a group, the bot is addressed when it is @mentioned or when
+            // the message replies to one of its own. DMs are left alone: an
+            // unknown DM must stay silent.
+            const contextInfo =
+              normalized.extendedTextMessage?.contextInfo ??
+              normalized.imageMessage?.contextInfo ??
+              normalized.videoMessage?.contextInfo;
+            const isMention =
+              isGroup &&
+              ((contextInfo?.mentionedJid ?? []).some((jid) => isBotJid(jid)) ||
+                (Boolean(contextInfo?.stanzaId) && isBotJid(contextInfo?.participant)));
 
             // Download media attachments (images, video, audio, documents)
             const attachments = await downloadInboundMedia(msg, normalized);
@@ -598,6 +646,7 @@ registerChannelAdapter('whatsapp', {
                 chatJid,
               },
               timestamp,
+              ...(isMention && { isMention: true }),
             };
 
             // WhatsApp doesn't use threads — threadId is null
@@ -727,6 +776,21 @@ registerChannelAdapter('whatsapp', {
 
       isConnected() {
         return connected;
+      },
+
+      async isGroupMember(platformId: string): Promise<boolean> {
+        if (!platformId.endsWith('@g.us')) return true;
+        try {
+          groupMetadataCache.delete(platformId);
+          const metadata = await sock.groupMetadata(platformId);
+          return metadata.participants.some(
+            (p) => isBotJid(p.id) || isBotJid((p as { lid?: string }).lid) || isBotJid((p as { jid?: string }).jid),
+          );
+        } catch (err) {
+          // WhatsApp refuses the metadata of a group the account is not in.
+          log.info('Group metadata unavailable — treating the bot as not a member', { platformId, err });
+          return false;
+        }
       },
 
       async syncConversations(): Promise<ConversationInfo[]> {

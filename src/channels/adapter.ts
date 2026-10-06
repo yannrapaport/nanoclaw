@@ -23,6 +23,12 @@ export interface ChannelSetup {
 
   /** Called when a user clicks a button/action in a card (e.g., ask_user_question response). */
   onAction(questionId: string, selectedOption: string, userId: string): void;
+
+  /** Called when the adapter sees the bot being added to a group. */
+  onGroupJoined?(platformId: string, name?: string): void;
+
+  /** Called after a sync with the complete list of groups the bot sits in. */
+  onGroupsSynced?(groups: Array<{ platformId: string; name?: string }>): void;
 }
 
 /** Delivery address used for reply-to overrides and (normally) the inbound's own origin. */
@@ -131,6 +137,13 @@ export interface ChannelAdapter {
   // Optional
   setTyping?(platformId: string, threadId: string | null): Promise<void>;
   syncConversations?(): Promise<ConversationInfo[]>;
+
+  /**
+   * Whether the bot currently sits in this group, asked of the platform (not
+   * a cache). A send to a group the bot has left fails without an error on
+   * some platforms; callers check first when the message must not be lost.
+   */
+  isGroupMember?(platformId: string): Promise<boolean>;
 
   /**
    * Subscribe the bot to a thread so follow-up messages route via the

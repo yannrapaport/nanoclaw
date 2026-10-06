@@ -129,6 +129,24 @@ export function setChannelRequestGate(fn: ChannelRequestGateFn): void {
   channelRequestGate = fn;
 }
 
+/**
+ * Inbound-interceptor hook. Runs first, before any messaging-group lookup.
+ *
+ * Lets a module take a message out of normal routing — the personas module
+ * uses it to read the owner's DM as the answer to a pending setup, and to
+ * claim mentions in groups nobody wired. Returning true ends routing.
+ */
+export type InboundInterceptorFn = (event: InboundEvent) => Promise<boolean>;
+
+let inboundInterceptor: InboundInterceptorFn | null = null;
+
+export function setInboundInterceptor(fn: InboundInterceptorFn): void {
+  if (inboundInterceptor) {
+    log.warn('Inbound interceptor overwritten');
+  }
+  inboundInterceptor = fn;
+}
+
 function safeParseContent(raw: string): { text?: string; sender?: string; senderId?: string } {
   try {
     return JSON.parse(raw);
@@ -148,6 +166,8 @@ export async function routeInbound(event: InboundEvent): Promise<void> {
   if (adapter && !adapter.supportsThreads) {
     event = { ...event, threadId: null };
   }
+
+  if (inboundInterceptor && (await inboundInterceptor(event))) return;
 
   const isMention = event.message.isMention === true;
 
@@ -319,7 +339,8 @@ export async function routeInbound(event: InboundEvent): Promise<void> {
 /**
  * Decide whether a given wired agent should engage on this message.
  *
- *   'pattern'        — regex test on text; '.' = always
+ *   'pattern'        — regex test on text; '.' = always. A platform
+ *                      mention (`isMention`) engages too.
  *   'mention'        — bot must be mentioned on the platform. Resolved by
  *                      the adapter (SDK-level) and forwarded as
  *                      `event.message.isMention`. Agent display name
@@ -347,6 +368,9 @@ function evaluateEngage(
     case 'pattern': {
       const pat = agent.engage_pattern ?? '.';
       if (pat === '.') return true;
+      // A platform mention of the bot, or a reply to one of its messages,
+      // addresses the persona as surely as its name does.
+      if (isMention) return true;
       try {
         return new RegExp(pat).test(text);
       } catch {

@@ -358,13 +358,23 @@ async function deliverMessage(
     msg.content,
     files,
   );
-  log.info('Message delivered', {
+  const deliveryLog = {
     id: msg.id,
     channelType: msg.channel_type,
     platformId: msg.platform_id,
     platformMsgId,
     fileCount: files?.length,
-  });
+  };
+  // No platform message id on a plain text message means nothing proves it
+  // reached the chat: WhatsApp answers that way when the bot is no longer in
+  // the group. Say so instead of logging it as delivered. (The local CLI
+  // channel never returns an id.)
+  const hasText = Boolean(content.text || content.markdown);
+  if (!platformMsgId && msg.channel_type !== 'cli' && !files?.length && hasText) {
+    log.warn('Message NOT confirmed by platform (no message id)', deliveryLog);
+  } else {
+    log.info('Message delivered', deliveryLog);
+  }
 
   clearOutbox(session.agent_group_id, session.id, msg.id);
 
