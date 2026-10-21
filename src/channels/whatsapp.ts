@@ -719,6 +719,18 @@ registerChannelAdapter('whatsapp', {
         }
       },
 
+      async deleteMessage(platformId: string, messageId: string): Promise<boolean> {
+        try {
+          await sock.sendMessage(platformId, {
+            delete: { remoteJid: platformId, id: messageId, fromMe: true },
+          });
+          return true;
+        } catch (err) {
+          log.warn('Failed to delete message', { platformId, messageId, err });
+          return false;
+        }
+      },
+
       async teardown() {
         connected = false;
         sock?.end(undefined);

@@ -16,10 +16,11 @@
  *                             "threadId": null} }         # route to a specific mg
  *     { "text": "...", "to": {...}, "reply_to": {...} }   # + redirect replies
  *     { "deliver": true, "text": "...", "to": {...} }     # post verbatim, no agent
+ *     { "delete": true, "messageId": "...", "to": {...} } # delete a bot message for everyone
  *   Server → client:
  *     { "text": "agent reply" }
  *     { "ok": true, "messageId": "..." }                  # answer to `deliver`
- *     { "ok": false, "error": "..." }                     # (see raw-deliver.ts)
+ *     { "ok": false, "error": "..." }                     # (see raw-deliver.ts, raw-delete.ts)
  *
  * The `to` and `reply_to` addressing is how admin transports (the bootstrap
  * script) inject messages targeting any wired channel. `reply_to` is a
@@ -45,6 +46,7 @@ import { getMessagingGroupByPlatform } from '../db/messaging-groups.js';
 import { log } from '../log.js';
 import type { ChannelAdapter, ChannelSetup, DeliveryAddress, InboundEvent, OutboundMessage } from './adapter.js';
 import { getChannelAdapter, registerChannelAdapter } from './channel-registry.js';
+import { rawDelete } from './raw-delete.js';
 import { rawDeliver } from './raw-deliver.js';
 
 const PLATFORM_ID = 'local';
@@ -191,6 +193,8 @@ function createAdapter(): ChannelAdapter {
   ): Promise<void> {
     let payload: {
       deliver?: unknown;
+      delete?: unknown;
+      messageId?: unknown;
       text?: unknown;
       to?: unknown;
       reply_to?: unknown;
@@ -203,6 +207,27 @@ function createAdapter(): ChannelAdapter {
       log.warn('CLI: ignoring non-JSON line from client', { line });
       return;
     }
+    if (payload.delete === true) {
+      // Delete a message the bot sent — one-shot, answers like `deliver`.
+      const target = parseAddress(payload.to);
+      const result =
+        target && typeof payload.messageId === 'string'
+          ? await rawDelete(target, payload.messageId, { getMessagingGroupByPlatform, getChannelAdapter }).catch(
+              (err: unknown) => {
+                log.error('CLI: raw delete threw', { err });
+                return { ok: false as const, error: 'delete_threw' };
+              },
+            )
+          : { ok: false as const, error: 'missing_to_or_message_id' };
+      log.info('CLI raw delete', { channelType: target?.channelType, platformId: target?.platformId, ...result });
+      try {
+        socket.write(JSON.stringify(result) + '\n');
+      } catch (err) {
+        log.warn('CLI: failed to answer raw delete', { err });
+      }
+      return;
+    }
+
     if (typeof payload.text !== 'string' || payload.text.length === 0) return;
 
     const to = parseAddress(payload.to);

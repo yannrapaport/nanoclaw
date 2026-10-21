@@ -130,6 +130,8 @@ export interface ChannelAdapter {
 
   // Optional
   setTyping?(platformId: string, threadId: string | null): Promise<void>;
+  /** Delete for everyone a message the bot itself sent. Resolves false if the platform refused. */
+  deleteMessage?(platformId: string, messageId: string): Promise<boolean>;
   syncConversations?(): Promise<ConversationInfo[]>;
 
   /**
