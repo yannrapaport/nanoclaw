@@ -157,6 +157,17 @@ Four types of skills. See [CONTRIBUTING.md](CONTRIBUTING.md) for the full taxono
 
 Before creating a PR, adding a skill, or preparing any contribution, you MUST read [CONTRIBUTING.md](CONTRIBUTING.md). It covers accepted change types, the four skill types and their guidelines, `SKILL.md` format rules, and the pre-submission checklist.
 
+## Mise en prod
+
+- **Mode** : merge + deploy
+- **Branche** : main (origin = fork ; ne jamais pousser sur `upstream` ni `git merge upstream`)
+- **Tests** : `pnpm test` ; `pnpm run typecheck` ; `cd container/agent-runner && bun test` si le runner change
+- **Déploiement** : `pnpm run build && systemctl --user restart nanoclaw` ; `./container/build.sh` avant si `container/` change (détail : § Development)
+- **Machine** : nexus
+- **Vérif** : `systemctl --user is-active nanoclaw` ; `tail logs/nanoclaw.log`
+- **Confirmation** : non pour le code ; oui si le diff touche l'envoi WhatsApp ou un canal câblé
+- `dist/` est gitignoré : sans build, le merge ne change rien. Ne pas embarquer les `scripts/wire-*.ts` untracked.
+
 ## Development
 
 Run commands directly — don't tell the user to run them.
