@@ -35,6 +35,7 @@ import type { GroupMetadata, WAMessageKey, WAMessage, WASocket } from '@whiskeys
 import { ASSISTANT_HAS_OWN_NUMBER, ASSISTANT_NAME, DATA_DIR } from '../config.js';
 import { readEnvFile } from '../env.js';
 import { log } from '../log.js';
+import { transcribeAudio, voiceNoteText } from '../transcribe.js';
 import { registerChannelAdapter } from './channel-registry.js';
 import { normalizeOptions, type NormalizedOption } from './ask-question.js';
 import type { ChannelAdapter, ChannelSetup, ConversationInfo, InboundMessage, OutboundMessage } from './adapter.js';
@@ -562,6 +563,14 @@ registerChannelAdapter('whatsapp', {
             // fromMe is always true for messages sent from this linked device,
             // regardless of ASSISTANT_HAS_OWN_NUMBER mode.
             if (fromMe) continue;
+
+            // Notes vocales en conversation privée : transcrites en local pour que l'agent
+            // puisse les lire. Pas en groupe : volume et CPU (2 vCPU) — à étendre si besoin.
+            const voice = attachments.find((a) => a.type === 'audio');
+            if (voice && !isGroup) {
+              const transcript = await transcribeAudio(path.join(DATA_DIR, voice.localPath));
+              content = voiceNoteText(transcript, content);
+            }
 
             const isBotMessage = ASSISTANT_HAS_OWN_NUMBER ? false : content.startsWith(`${ASSISTANT_NAME}:`);
 
