@@ -29,6 +29,7 @@ import {
 import { findSessionForAgent } from './db/sessions.js';
 import { startTypingRefresh } from './modules/typing/index.js';
 import { log } from './log.js';
+import { plushySpoolHook } from './plushy-spool.js';
 import { resolveSession, writeSessionMessage, writeOutboundDirect } from './session-manager.js';
 import { wakeContainer } from './container-runner.js';
 import { getSession } from './db/sessions.js';
@@ -150,6 +151,13 @@ export async function routeInbound(event: InboundEvent): Promise<void> {
   }
 
   const isMention = event.message.isMention === true;
+
+  // 0b. Plushy spool (La Pelucherie): in the groups listed in
+  //     PLUSHY_SPOOL_GROUPS, an `@Plushy` call is written to a spool for
+  //     lp-inbox-assistant. Side effect only — routing continues unchanged
+  //     (in an unwired group a non-mention message is then dropped as before,
+  //     so no channel-approval card is ever raised).
+  plushySpoolHook(event);
 
   // 1. Combined lookup: messaging_group row + count of wired agents in a
   //    single query. Cheap short-circuit for the common "unwired channel"

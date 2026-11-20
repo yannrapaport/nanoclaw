@@ -563,6 +563,14 @@ registerChannelAdapter('whatsapp', {
             // regardless of ASSISTANT_HAS_OWN_NUMBER mode.
             if (fromMe) continue;
 
+            // A forwarded message is someone else's text: flagged so that a
+            // downstream consumer (Plushy spool) never treats it as a request.
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any
+            const ctxInfo = (normalized.extendedTextMessage?.contextInfo ||
+              normalized.imageMessage?.contextInfo ||
+              normalized.videoMessage?.contextInfo) as any;
+            const isForwarded = ctxInfo?.isForwarded === true;
+
             const isBotMessage = ASSISTANT_HAS_OWN_NUMBER ? false : content.startsWith(`${ASSISTANT_NAME}:`);
 
             // Check if this reply answers a pending question via slash command
@@ -596,6 +604,7 @@ registerChannelAdapter('whatsapp', {
                 isBotMessage,
                 isGroup,
                 chatJid,
+                ...(isForwarded && { isForwarded: true }),
               },
               timestamp,
             };
